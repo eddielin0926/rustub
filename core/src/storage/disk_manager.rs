@@ -40,10 +40,12 @@ impl DiskManager {
 
     /// Reads a page from disk into the provided buffer.
     pub fn fetch_page(&self, page_id: PageIdRef, page: &mut Page) -> Result<(), DiskError> {
-        let page_id = page_id.ok_or(DiskError::InvalidPageId)?;
+        let page_id = page_id.ok_or_else(|| DiskError::InvalidPageId)?;
         let offset = {
             let page_table = self.page_table.lock().unwrap();
-            *page_table.get(&page_id).ok_or(DiskError::PageNotFound)?
+            *page_table
+                .get(&page_id)
+                .ok_or_else(|| DiskError::PageNotFound)?
         };
 
         let file = self.db_file.lock().unwrap();
@@ -54,7 +56,7 @@ impl DiskManager {
 
     /// Writes a page to disk. Allocates a new page slot if this is the first time the page is flushed.
     pub fn flush_page(&self, page_id: PageIdRef, page: &Page) -> Result<(), DiskError> {
-        let page_id = page_id.ok_or(DiskError::InvalidPageId)?;
+        let page_id = page_id.ok_or_else(|| DiskError::InvalidPageId)?;
 
         let offset = {
             let mut table = self.page_table.lock().unwrap();
