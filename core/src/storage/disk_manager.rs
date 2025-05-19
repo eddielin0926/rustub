@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use crate::constants::{DEFAULT_DB_PAGES, PAGE_SIZE};
 use crate::errors::DiskError;
@@ -11,60 +11,72 @@ use crate::types::{PageId, PageIdRef};
 
 use super::page::Page;
 
+/// `DiskManager` handles low-level operations:
+/// - Reading and writing pages from/to disk
+/// - Page allocation
+/// Note: it does not handle buffer management or transactional consistency.
 pub struct DiskManager {
-    db_file: Arc<Mutex<File>>,
+    db_file: Mutex<File>,
     page_table: Mutex<HashMap<PageId, usize>>,
     num_pages: Mutex<usize>,
+    // TODO: Maintain a reusable free list for deleted pages.
+    // free_pages: Mutex<Vec<usize>>,
 }
 
 impl DiskManager {
-    pub fn new<P: AsRef<Path>>(db_file_path: P) -> io::Result<Self> {
-        let db_file = OpenOptions::new()
+    /// Create or open the underlying database file.
+    pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .open(db_file_path)?;
+            .open(path)?;
         Ok(Self {
-            db_file: Arc::new(Mutex::new(db_file)),
+            db_file: Mutex::new(file),
             page_table: Mutex::new(HashMap::new()),
             num_pages: Mutex::new(DEFAULT_DB_PAGES),
         })
     }
 
-    pub fn read_page(&self, page_id: PageIdRef, page: &mut Page) -> Result<(), DiskError> {
+    /// Reads a page from disk into the provided buffer.
+    pub fn fetch_page(&self, page_id: PageIdRef, page: &mut Page) -> Result<(), DiskError> {
         let page_id = page_id.ok_or(DiskError::InvalidPageId)?;
-        let page_table = self.page_table.lock().unwrap();
-        let offset = *page_table.get(&page_id).ok_or(DiskError::PageNotFound)?;
-
-        let file = self.db_file.lock().unwrap();
-        file.read_at(page.as_mut_slice(), offset as u64)?;
-        Ok(())
-    }
-
-    pub fn write_page(&self, page_id: PageIdRef, page: &Page) -> Result<(), DiskError> {
-        let page_id = page_id.ok_or(DiskError::InvalidPageId)?;
-
         let offset = {
-            let mut page_table = self.page_table.lock().unwrap();
-            match page_table.get(&page_id) {
-                Some(&offset) => offset,
-                None => {
-                    let offset = self.allocate_page();
-                    page_table.insert(page_id, offset);
-                    offset
-                }
-            }
+            let page_table = self.page_table.lock().unwrap();
+            *page_table.get(&page_id).ok_or(DiskError::PageNotFound)?
         };
 
         let file = self.db_file.lock().unwrap();
-        file.write_at(page.as_slice(), offset as u64)?;
+        file.read_at(page.as_mut_slice(), offset as u64)
+            .map_err(DiskError::Io)?;
         Ok(())
     }
 
+    /// Writes a page to disk. Allocates a new page slot if this is the first time the page is flushed.
+    pub fn flush_page(&self, page_id: PageIdRef, page: &Page) -> Result<(), DiskError> {
+        let page_id = page_id.ok_or(DiskError::InvalidPageId)?;
+
+        let offset = {
+            let mut table = self.page_table.lock().unwrap();
+            *table.entry(page_id).or_insert_with(|| self.allocate_page())
+        };
+
+        let file = self.db_file.lock().unwrap();
+        file.write_at(page.as_slice(), offset as u64)
+            .map_err(DiskError::Io)?;
+        Ok(())
+    }
+
+    /// Marks a page as deleted. Future implementation may support page reuse.
+    pub fn delete_page(&self, _page_id: PageIdRef) -> Result<(), DiskError> {
+        todo!("delete_page will support free page reuse");
+    }
+
+    /// Allocates the next available page slot and returns its byte offset.
     fn allocate_page(&self) -> usize {
-        let mut pages = self.num_pages.lock().unwrap();
-        let offset = *pages * PAGE_SIZE;
-        *pages += 1;
+        let mut np = self.num_pages.lock().unwrap();
+        let offset = *np * PAGE_SIZE;
+        *np += 1;
         offset
     }
 }
@@ -76,25 +88,24 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn test_write_then_read_page() {
+    fn test_flush_then_fetch_page() {
         let file = NamedTempFile::new().unwrap();
         let path = file.path().to_path_buf();
-        drop(file); // close tempfile to let DiskManager open it
+        drop(file); // Let DiskManager take ownership
 
         let dm = DiskManager::new(&path).unwrap();
         let page_id = Some(1);
 
-        // Construct dummy page
         let mut write_page = Page::new();
         write_page.as_mut_slice()[0..4].copy_from_slice(&123u32.to_le_bytes());
-
-        dm.write_page(page_id, &write_page).unwrap();
+        dm.flush_page(page_id, &write_page).unwrap();
 
         let mut read_page = Page::new();
-        dm.read_page(page_id, &mut read_page).unwrap();
-
+        dm.fetch_page(page_id, &mut read_page).unwrap();
         let read_val = u32::from_le_bytes(read_page.as_slice()[0..4].try_into().unwrap());
+
         assert_eq!(read_val, 123);
+        debug_assert_eq!(read_page.as_slice()[4..], [0; PAGE_SIZE - 4]);
 
         remove_file(path).unwrap();
     }
