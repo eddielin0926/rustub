@@ -8,7 +8,7 @@ pub struct LruKReplacer {
     k: usize,
     current_timestamp: usize,
     history: HashMap<FrameId, VecDeque<usize>>,
-    pinned: HashSet<FrameId>,
+    non_evictable: HashSet<FrameId>,
 }
 
 impl Replacer for LruKReplacer {
@@ -23,12 +23,12 @@ impl Replacer for LruKReplacer {
         }
     }
 
-    fn pin(&mut self, frame_id: FrameId) {
-        self.pinned.insert(frame_id);
-    }
-
-    fn unpin(&mut self, frame_id: FrameId) {
-        self.pinned.remove(&frame_id);
+    fn set_evictable(&mut self, frame_id: FrameId, evictable: bool) {
+        if evictable {
+            self.non_evictable.remove(&frame_id);
+        } else {
+            self.non_evictable.insert(frame_id);
+        }
     }
 
     fn evict(&mut self) -> Option<FrameId> {
@@ -37,7 +37,7 @@ impl Replacer for LruKReplacer {
         let mut oldest_history: usize = 0;
 
         for (&frame_id, history) in &self.history {
-            if self.pinned.contains(&frame_id) {
+            if self.non_evictable.contains(&frame_id) {
                 continue;
             }
 
@@ -59,7 +59,7 @@ impl Replacer for LruKReplacer {
 
         if let Some(fid) = victim {
             self.history.remove(&fid);
-            self.pinned.remove(&fid);
+            self.non_evictable.remove(&fid);
         }
 
         victim
@@ -72,7 +72,7 @@ impl LruKReplacer {
             k,
             current_timestamp: 0,
             history: HashMap::new(),
-            pinned: HashSet::new(),
+            non_evictable: HashSet::new(),
         }
     }
 }
@@ -92,7 +92,7 @@ mod tests {
     fn pin_all() {
         let mut replacer = LruKReplacer::new(2);
         replacer.record_access(1);
-        replacer.pin(1);
+        replacer.set_evictable(1, true);
         assert_eq!(replacer.evict(), None);
     }
 }
